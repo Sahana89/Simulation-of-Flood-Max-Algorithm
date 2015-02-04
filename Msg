@@ -1,0 +1,20 @@
+
+public class Msg {
+	public static final int DUMMY = 00;
+	public static final int NEGATIVE_ACK = 01;
+	public static final int POSITIVE_ACK = 10;
+	public static final int POSSIBLE_LEADER = 11;
+	public static final int FLOODMAX_END = 111;
+	int source;
+	int destination;
+	int msg_type;
+	int leader_id;
+	
+	public Msg(int src, int dest, int msg_type, int leader_id)
+	{
+		source = src;
+		destination = dest;
+		this.msg_type = msg_type;
+		this.leader_id = leader_id;
+	}// End of constructor
+} // End of class Msg
