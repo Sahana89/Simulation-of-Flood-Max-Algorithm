@@ -1,0 +1,15 @@
+
+public class Neighbour {
+	public int id;
+	public float link_wt;
+	public boolean sent_ack;
+	public int ack_value; // 1 means +ve ack, 0 means -ve ack, -1 means parent
+	
+	public Neighbour(int id, float link_wt)
+	{
+		this.id = id;
+		this.link_wt = link_wt;	
+		sent_ack = Boolean.FALSE;
+		ack_value = 0; // ack_value is meaningful only if sent_ack is true
+	} // End of constructor Neighbour()	
+}
