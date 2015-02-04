@@ -1,0 +1,424 @@
+
+import java.util.ArrayList;
+import java.util.concurrent.LinkedBlockingQueue;
+
+public class DistProcess extends Thread
+{
+	private int process_id;
+	private ArrayList<Neighbour> neighbours;
+	private int local_leader; //Stores leader id seen so far
+	private int parent; // parent = -1 indicates root of the tree
+	private LinkedBlockingQueue<Msg> queueList[];
+	private int round;
+	private Integer roundObj; // Synchronization object used by control thread to mark start of new round
+	private boolean term_status[]; //Thread's termination status
+	private Integer ts_synch[];
+	private FloodMaxSynch.Output my_result;
+	
+	int num_expected_msgs;// Until I don't receive these many messages from neighbours, I am not done with current round
+	Msg read_msgs[];
+	ArrayList<Msg> msgs_to_send;
+	public boolean terminate;
+	int prev_round_leader;
+	 
+	public DistProcess(int id, ArrayList<Neighbour> neigh_list, FloodMaxSynch.SharedData gdata)
+	{
+		//Data local to thread 
+		round = 0;
+		process_id = id;
+		local_leader = process_id; // Initially I am the leader
+		prev_round_leader = process_id;
+		parent = -1; // Initially each node is root
+		neighbours = neigh_list;
+		num_expected_msgs = neighbours.size();
+		read_msgs = null;
+		msgs_to_send = new ArrayList<Msg>();
+		terminate = Boolean.FALSE;
+		
+		//Global data
+		roundObj = gdata.roundObj;
+		term_status = gdata.term_status;
+		ts_synch = gdata.ts_synch;
+		queueList = gdata.mqueues;
+		my_result = gdata.result[process_id];
+
+		/*
+		printNeighbours(); // Printing my adjacent nodes
+		for(int i=0; i< queueList.length; i++)
+			System.out.println(process_id+" : "+queueList[i]);
+			*/
+	} // End of thread constructor
+	
+	public void run() 
+	{
+		Msg temp_msg;		
+		
+		while (terminate != Boolean.TRUE)
+		{
+			num_expected_msgs = neighbours.size();
+			
+			//Send msg to my neighbours
+			temp_msg = new Msg(process_id, 0, Msg.POSSIBLE_LEADER, local_leader); //sendMsg will put appropriate destination value
+			genMsg(temp_msg);
+			
+			if(round != 0)
+				prev_round_leader = local_leader;
+			
+			//First read all messages and then process
+			while(num_expected_msgs > 0)
+			{
+				readFromMsgQueue();
+				if (read_msgs != null)
+					processMsg(); //Now process read messages
+				//System.out.println("Process "+ process_id+" : expecting messages: "+num_expected_msgs);
+				read_msgs = null; //Clearing the read_msg array
+			} // Read and process
+			//System.out.println("Round "+ round+", Process "+ process_id+" :Got all messages");
+			
+			//Done receiving messages for current round, check neighbours var for termination condition.
+			//If my local_leader_id matches with my_id, then num of acks I should expect are = num of neighbours
+			// otherwise num of acks I should expect are = num of neighbours - 1
+			
+			if(! terminate)
+			{
+				if (process_id != local_leader) //I am intermediate node / leaf
+				{
+					//Checking for termination condition
+					Neighbour node;
+					boolean term = Boolean.TRUE;
+					for(int k=0; k<neighbours.size();k++)
+					{
+						node = neighbours.get(k);
+						// Node is not my parent and it has not sent ack/nack
+						if (node.id != parent && node.sent_ack == Boolean.FALSE )
+						{
+							term = Boolean.FALSE;
+							break;
+						}
+					} //End of checking status of all neighbours
+					if(term)
+					{
+						//System.out.println("Process: "+process_id+" got all ack_nacks");
+						//Send +ve ack to parent
+						//System.out.println("Process "+process_id+" sending POSITIVE_ACK to parent "+parent);
+						temp_msg = new Msg(process_id, parent, Msg.POSITIVE_ACK, local_leader);
+						genMsg(temp_msg);
+					} //Time to send +ack to parent
+				} //Intermediate node / leaf node
+				else
+				{
+					// Since currently local_leader = my_process_id, I could be leader
+					//Checking for termination condition
+					Neighbour node;
+					boolean term = Boolean.TRUE;
+					for(int k=0; k<neighbours.size();k++)
+					{
+						node = neighbours.get(k);
+						// Node is not my parent and it has not sent ack/nack
+						if (node.id != parent && node.sent_ack == Boolean.FALSE )
+						{
+							term = Boolean.FALSE;
+							break;
+						}
+					} // End of checking status of all neighbours
+					if(term)
+					{
+						boolean all_acks = Boolean.TRUE;
+						for(int k=0; k<neighbours.size(); k++)
+						{
+							node = neighbours.get(k);
+							if(node.ack_value != 1)
+							{
+								all_acks = Boolean.FALSE;
+								break;
+							}// -ve ack found						
+						}// End of checking ack status for all neighbours
+						
+						if(all_acks)
+						{
+							// I am the leader
+							terminate = Boolean.TRUE;
+							synchronized(ts_synch[process_id])
+							{
+								term_status[process_id] = Boolean.TRUE;
+							}
+							//Save information about my child children in global variable, all my neighbours are my children
+							my_result.leader = Boolean.TRUE;
+							my_result.leader_id = local_leader;
+							Neighbour my_node;
+							for(int k=0; k<neighbours.size(); k++)
+							{
+								my_node = neighbours.get(k);
+								if(my_node.ack_value == 1)
+									my_result.children.add(new Integer(my_node.id));
+							} // saving information in global var
+							
+							//Time to terminate algorithm, notify all nodes
+							System.out.println("Process "+ process_id+" is leader:  Notifying FloodMax end");
+							temp_msg = new Msg(process_id, 0, Msg.FLOODMAX_END, -1);
+							genMsg(temp_msg);
+							break; //Break the outer while loop for leader
+						}// I am leader
+					} //Time to terminate
+				} // else part, I could be leader
+				
+				// This must be synchronized, otherwise IllegalMonitorStateException is thrown
+				synchronized(roundObj)
+				{
+					//System.out.println("Process "+ process_id+" :will wait for other threads to finish");
+					try{
+						roundObj.wait();
+					}
+					catch(InterruptedException ip)
+					{
+						System.out.println("process "+ process_id+ " Interrupted while waiting");
+					} // End of catch
+					catch(IllegalMonitorStateException e) 
+					{
+						System.out.println("Exception in process"+process_id+ " : "+ e.toString());
+					}
+					round ++;
+					//System.out.println(process_id + " moving to round = "+ round);	
+				} // End of synchronized block	
+			}// Terminate = False
+		} // End of while i.e Flood Max
+	} // End of run()
+	
+	//Message generation function
+	public void genMsg(Msg message)
+	{	
+		// Send FLOODMAX_END message to all my neighbours, Leader send this msg when it gets all +ve acks
+		if (message.msg_type == Msg.FLOODMAX_END) {
+			int target;
+			int size = my_result.children.size();
+			for (int i = 0; i < size; i++) {
+				target = my_result.children.get(i).intValue();
+				message.destination = target;
+				// synchronization mechanism used on queue
+				synchronized (queueList[target]) {
+					queueList[target].add(message); // Insert msg into queue
+				}// End of synchronized block
+				System.out.println("Round "+round+ ", Process "+process_id+" FLOODMAX_END msg to neighbour "
+						+ target);
+			}//End of for		
+		} // End of FLOODMAX_END message
+		
+		//Send POSSIBLE_LEADER msg
+		//In first round, send POSSIBLE_LEADER to all neighbours
+		if (message.msg_type == Msg.POSSIBLE_LEADER) {
+			int target;
+			if (round == 0)
+				for (int i = 0; i < neighbours.size(); i++) {
+					target = neighbours.get(i).id;
+					message.destination = target;
+					// synchronization mechanism used on queue
+					synchronized (queueList[target]) {
+						queueList[target].add(message); // Insert msg into queue
+					}// End of synchronized block
+					//System.out.println("Round "+round+ ", Process "+process_id+" POSSIBLE_LEADER = "+local_leader+" msg to neighbour "+ target);
+				} // End of for loop
+			else {
+				// If local leader remains same for two successive round, then in 2'nd round send dummy msg instead of POSSIBLE_LEADER
+				int msg_type;
+				if(prev_round_leader == local_leader)
+					msg_type = Msg.DUMMY;
+				else
+					msg_type = Msg.POSSIBLE_LEADER;
+	
+				// Send msg to all adjacent nodes except parent
+				for (int i = 0; i < neighbours.size(); i++) {
+					target = neighbours.get(i).id;
+					if (target == parent) {
+						Msg new_msg = new Msg(process_id, parent, Msg.DUMMY,
+								parent);
+						// synchronization mechanism used on queue
+						synchronized (queueList[target]) {
+							queueList[target].add(new_msg); // Insert msg into
+															// queue
+						}// End of synchronized block
+						//System.out.println("Round "+round+", Process " + process_id+ " DUMMY msg to to-be-parent " + target);
+					} else {
+						message.destination = target;
+						message.msg_type = msg_type;
+						// synchronization mechanism used on queue
+						synchronized (queueList[target]) {
+							queueList[target].add(message); // Insert msg into
+															// queue
+						}// End of synchronized block
+						
+						/*
+						if(msg_type == Msg.POSSIBLE_LEADER)
+							System.out.println("Round "+round+", Process "+process_id+" POSSIBLE_LEADER = "+local_leader+" msg to neighbour "+ target);
+						else
+							System.out.println("No Improv: Process "+ process_id+" , round= "+round+", Dummy msg to"+ target);
+							*/
+					} // End of else
+				}// End of sending msg to all neighbours except my to-be-parent
+			} // Else part, Other than first round
+		} // POSSIBLE_LEADER type msg
+		
+		//Sending +ve Ack
+		if(message.msg_type == Msg.POSITIVE_ACK)
+			synchronized(queueList[message.destination]) 
+			{
+				//Insert msg into destination's queue
+				queueList[message.destination].add(message);
+			}// End of synchronized block
+		
+		//Sending all accumulated messages in msgs_to_send
+		if(! msgs_to_send.isEmpty())
+		{
+			int target;
+			for(int i=0; i< msgs_to_send.size(); i++)
+			{
+				target = msgs_to_send.get(i).destination;
+				synchronized(queueList[target]) 
+				{
+					//Insert msg into destination's queue
+					queueList[target].add(msgs_to_send.get(i));
+				}// End of synchronized block
+			} // End of sending messages
+			msgs_to_send.clear();
+		}// End of sending mesages		
+	} // End of function generate msg
+	
+	public void readFromMsgQueue()
+	{
+		synchronized(queueList[process_id]) 
+		{
+			read_msgs = new Msg[queueList[process_id].size()];
+			queueList[process_id].toArray(read_msgs);
+			queueList[process_id].clear();
+		}// End of synchronized block
+		
+	} // End of method readFromMsgQueue()
+	
+	//Message processing function
+	public void processMsg()
+	{
+		Msg new_msg;
+		// Update fields local_leader, parent and child 
+		if (read_msgs.length != 0)
+		{
+			for(int i = 0; i < read_msgs.length; i++)
+			{
+				//MSG_TYPE = POSSIBLE_LEADER
+				if(read_msgs[i].msg_type == Msg.POSSIBLE_LEADER)
+				{
+					//System.out.println("Round "+round+" Process "+process_id+" got leader_id= "+ read_msgs[i].leader_id+ " from "+read_msgs[i].source);
+					num_expected_msgs--;
+					if(local_leader == read_msgs[i].leader_id)
+					{
+						new_msg = new Msg(process_id, read_msgs[i].source, Msg.NEGATIVE_ACK, read_msgs[i].leader_id);
+						msgs_to_send.add(new_msg);
+						continue; // Go to next msg
+					} // I can not be target node's child
+					
+					if(local_leader > read_msgs[i].leader_id) // I have better leader_id
+						continue; //go to next msg
+					
+					if(local_leader < read_msgs[i].leader_id) //Got better leader_id
+					{	
+						//Update local_leader_id and parent
+						local_leader = read_msgs[i].leader_id;
+						parent = read_msgs[i].source;
+						
+						//Now wait for acks for this new leader_id, resetting ack_status
+						for (int k=0; k < neighbours.size(); k++)
+						{
+							neighbours.get(k).sent_ack = Boolean.FALSE;
+							neighbours.get(k).ack_value = 0;
+						}
+					} //End of updating leader_id
+				} // Got new leader_id from neighbour
+				
+				//MSG_TYPE = POSITIVE_ACK
+				if(read_msgs[i].msg_type == Msg.POSITIVE_ACK)
+				{
+					//System.out.println("Round: "+ round+" , process "+ process_id+ " got +ack from "+ read_msgs[i].source+ "for leader = "+ read_msgs[i].leader_id);
+					//Save the ack_status
+					if(read_msgs[i].leader_id == local_leader)
+					{
+						Neighbour node;
+						for (int k=0; k < neighbours.size(); k++)
+						{
+							node = neighbours.get(k);
+							if(node.id == read_msgs[i].source)
+							{
+								node.sent_ack = Boolean.TRUE;
+								node.ack_value = 1;
+								break;
+							}
+						} // End of updating ack_status
+					} //End of Ack to be considered								
+				} // End of positive ack
+				
+				//MSG_TYPE = NEGATIVE_ACK
+				if(read_msgs[i].msg_type == Msg.NEGATIVE_ACK)
+				{
+					//System.out.println("Round: "+ round+" , process "+ process_id+ " got -ack from "+ read_msgs[i].source+ " for leader = "+ read_msgs[i].leader_id);
+					if(read_msgs[i].leader_id == local_leader)
+					{
+						Neighbour node;
+						for (int k=0; k < neighbours.size(); k++)
+						{
+							node = neighbours.get(k);
+							if(node.id == read_msgs[i].source)
+							{
+								node.sent_ack = Boolean.TRUE;
+								node.ack_value = 0;
+								break;
+							}
+						} // End of updating ack_status
+					} //End of Ack to be considered							
+				} // End of negative ack
+				
+				//MSG_TYPE = DUMMY
+				if(read_msgs[i].msg_type == Msg.DUMMY)
+				{
+					//System.out.println("Round " +round+ " Process "+process_id+" received DUMMY msg from "+read_msgs[i].source);
+					num_expected_msgs--;
+					continue;
+				} // End of no_improvement msg
+				
+				//MSG_TYPE = FLOODMAX_END
+				if(read_msgs[i].msg_type == Msg.FLOODMAX_END)
+				{
+					//System.out.println("Round " +round+ " Process "+process_id+" :FLOODMAX_END from "+read_msgs[i].source);
+					num_expected_msgs = 0;
+					
+					// While terminating update local and global status
+					terminate = Boolean.TRUE;
+					synchronized(ts_synch[process_id])
+					{
+						term_status[process_id] = Boolean.TRUE;
+					}
+					
+					//Leaf and intermediate node saving children status
+					my_result.parent= parent;
+					my_result.leader_id = local_leader;
+					Neighbour node;
+					for(int k=0; k<neighbours.size(); k++)
+					{
+						node = neighbours.get(k);
+						if(node.ack_value == 1)
+							my_result.children.add(new Integer(node.id));
+					} // Updating global result
+					
+					//Now forward the msg to your children
+					new_msg = new Msg(process_id, 0, Msg.FLOODMAX_END, -1);
+					genMsg(new_msg);
+					break; //No need to process remaining msgs
+				} // FLOODMAX_END MSG		
+			} //End of processing all unread messages		
+		} // There are some unprocessed messages	
+	} // End of method processMsg
+	
+	public void printNeighbours()
+	{
+		System.out.println("I am process "+ process_id);
+		for(int i = 0; i< neighbours.size(); i++)
+			System.out.println("Neighbour Id: " + neighbours.get(i).id+ ", link_wt = "+ neighbours.get(i).link_wt);			
+	} // End of method printNeighbours
+
+} // End of class DistProcess
