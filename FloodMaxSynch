@@ -1,0 +1,226 @@
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.util.Scanner;
+import java.util.concurrent.LinkedBlockingQueue; 
+import java.util.ArrayList;
+
+public class FloodMaxSynch {
+	private int round;
+	private int num_proc;
+	private float topology[][];
+	private DistProcess processes[];
+	private SharedData global_data;
+	private boolean all_exited;
+	
+	public class Output{
+		ArrayList<Integer> children;
+		int parent;
+		int node_id;
+		boolean leader;
+		int leader_id;
+		
+		public Output(int id, int parent)
+		{
+			children = new ArrayList<Integer>();
+			node_id = id;
+			this.parent = parent;
+			leader = Boolean.FALSE;
+			leader_id = -1;
+		}
+	}//End of class Output
+	
+	//This class contains global data that we need to share between threads
+	public class SharedData{
+		public Integer roundObj; // object on which threads will be synchronized, defines round
+		public Integer floodmax_end; // algorithm termination mechanism, all threads wait on this object
+		public boolean term_status[]; //stores whether each process has reached floddmax end.
+		public Integer ts_synch[];
+		public LinkedBlockingQueue<Msg> mqueues[];
+		public Output result[];
+		
+		public SharedData()
+		{
+			roundObj = new Integer(0);
+			floodmax_end = new Integer(0);
+			term_status = new boolean[num_proc];
+			ts_synch = new Integer[num_proc];
+			for (int i = 0; i< num_proc; i++)
+				ts_synch[i] = new Integer(0);
+			//Create message queues for all threads
+			mqueues = new LinkedBlockingQueue[num_proc];
+			for (int i = 0; i< num_proc; i++)
+				mqueues[i] = new LinkedBlockingQueue<Msg> ();	
+			result = new Output[num_proc];
+			for(int k=0;k<num_proc;k++)
+				result[k] = new Output(k,-1);
+			//for(int i=0; i< num_proc; i++)
+				//System.out.println("Control thread: Msg_queue "+ i+" : "+mqueues[i]);
+		}// End of constructor		
+	} // End of class SharedData
+	
+	public FloodMaxSynch(String filename)
+	{
+		round = 0;
+		all_exited = Boolean.FALSE;
+		readInput(filename);
+		//printTopology();
+		global_data = new SharedData();
+
+		//Create Threads
+		processes = new DistProcess[num_proc];
+		createThreads();		
+	} // End of constructor
+	
+	private void readInput(String filename)
+	{
+		try{
+				Scanner scanner = new Scanner(new File(filename));
+				if (scanner.hasNextInt()) num_proc = scanner.nextInt();
+				topology = new float [num_proc][num_proc];
+				int i=0,j=0;
+				while(scanner.hasNextFloat()){
+				   topology[i][j++] = scanner.nextFloat();
+				   if (j==num_proc){
+					   i++;
+					   j=0;
+				   }
+				   if (i>=num_proc) break;
+			}
+			scanner.close();			
+		}
+		catch(FileNotFoundException e)
+		{
+			System.out.println(filename + " doesn't exist");
+			System.exit(1);
+		} // File not found
+	} // End of method readInput
+	
+	void printTopology()
+	{
+		System.out.println("# of processes: " + num_proc);
+		for (int i = 0; i < num_proc; i++)
+		{
+			System.out.print("Record"+i+": ");
+			for(int j= 0; j<num_proc; j++)
+			System.out.print(topology[i][j]+" ");
+			System.out.print("\n");
+		} //End of printing
+		System.out.println("----------------------");
+	} // End of method printTopology
+	
+	private void createThreads()
+	{
+		Neighbour new_neighbour;
+		ArrayList<Neighbour> neigh_list;
+		for (int i = 0; i < num_proc; i++)
+		{
+			neigh_list = new ArrayList<Neighbour>();
+			//Create list of each node's neighbours
+			for(int j=0; j<num_proc; j++)
+				if(topology[i][j] != 0)
+				{
+					new_neighbour = new Neighbour(j, topology[i][j]);
+					neigh_list.add(new_neighbour);
+				} // 
+			processes[i] = new DistProcess(i, neigh_list, global_data);
+		}
+		
+		for (int i = 0; i < num_proc; i++)
+			processes[i].start();
+		System.out.println("Done with creating all threads");
+		
+		while(! all_exited)
+		{
+			// All threads waiting implies current round is complete. Move to next round
+			System.out.println("Control Thread: Current round = "+ round);
+			Thread.State t_state;
+			boolean status = Boolean.FALSE;
+			int exit_count = 0;
+			
+			for (int i = 0; i < num_proc; i++)
+			{			
+				do{
+					//Skip the terminated thread
+					synchronized(global_data.ts_synch[i])
+					{
+						status = global_data.term_status[i];
+					}
+					if(status)
+					{
+						exit_count++;
+						break;
+					}
+					t_state = processes[i].getState();
+					//System.out.println("Control Thread: Thread "+ i+ "'s state: "+ t_state+ " termination stat: " +global_data.term_status[i]);
+				} while(t_state != Thread.State.WAITING);
+			}// End of checking status of all threads
+			
+			if(exit_count == num_proc)
+			{
+				all_exited = Boolean.TRUE;
+				System.out.println("Control thread detected that all threads will terminate");
+			}
+			
+			round++;
+			synchronized(global_data.roundObj)
+			{
+				try{
+					global_data.roundObj.notifyAll();
+					//System.out.println("Done notifying");
+					}// End of round indication
+				catch(IllegalMonitorStateException e){
+					System.out.println("Exception at round end: "+ e.toString());
+				}
+			} // End of synchronized block
+			
+		} // End of while i.e FloodMax Algo
+			
+		//Control thread waits for all other thread to terminate
+		for (int i = 0; i < num_proc; i++)
+			try{
+				processes[i].join();
+				System.out.println("Control thread: Thread "+i+" terminated");
+			}
+			catch (InterruptedException e){
+				System.out.println("Got interrupted while waiting for :" + i);
+				continue;
+			} // End of catch
+
+		System.out.println("Result of FloodMax is");
+		int size;
+		for(int k = 0; k< num_proc;k++)
+		{
+			if(global_data.result[k].leader)
+				System.out.println("Node "+k+" is LEADER");
+			else
+				System.out.println("Node "+ k+" : my parent = "+ global_data.result[k].parent+ " ,My leader = "+global_data.result[k].leader_id );
+			
+			size = global_data.result[k].children.size();
+			if(size == 0)
+				System.out.print("I am leaf node. ");
+			else
+				System.out.print("My Childrens are: ");
+			for(int j=0; j<size; j++ )
+				System.out.print(global_data.result[k].children.get(j).intValue()+ " ");
+			System.out.println("\n");
+		}
+		
+	} // End of method createThreads
+	
+	/**
+	 * @param args
+	 */
+	public static void main(String[] args) {
+		if (args.length != 1)
+		{
+			System.out.println("Usage: java FloodMaxSynch <Data-file>");
+			System.exit(1);
+						
+		} // End of reading input args
+		System.out.println("Reading data from: "+ args[0] );
+		FloodMaxSynch fm = new FloodMaxSynch(args[0]);
+
+	}// End of main method
+
+} //End of class
